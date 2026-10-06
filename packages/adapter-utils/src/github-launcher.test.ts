@@ -1,10 +1,10 @@
 import { execFile } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtemp, mkdir, symlink, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, copyFile, link, symlink, writeFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { githubBrokerEnvironment, githubLauncherSource } from "./github-launcher.js";
 const exec = promisify(execFile);
 const cleanups: Array<() => Promise<unknown>> = [];
@@ -12,23 +12,47 @@ afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) awai
 
 describe("managed GitHub launchers", () => {
 
-  // A launcher directory that holds only the shims, plus an isolated directory carrying
-  // nothing but a node symlink. The shebang needs node on PATH, and borrowing a real
-  // system bin directory would put a genuine extensionless git there as well, which is
-  // exactly the candidate these cases must not find.
+  // One copy of the node binary for the whole file. A `#!/bin/sh` fixture cannot be
+  // spawned on Windows, so cases that must actually run the resolved program use this
+  // instead, and copying it per case would cost ~100 MB each time.
+  let spawnableRoot = "";
+  let spawnableProgram = "";
+  beforeAll(async () => {
+    spawnableRoot = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-spawnable-"));
+    spawnableProgram = path.join(spawnableRoot, "program");
+    await copyFile(process.execPath, spawnableProgram);
+  });
+  afterAll(async () => { await rm(spawnableRoot, { recursive: true, force: true }); });
+
+  // Place the shared node copy as `name`. A hard link keeps it free; a filesystem that
+  // refuses one still gets a real executable.
+  async function placeSpawnable(directory: string, name: string) {
+    const target = path.join(directory, name);
+    try { await link(spawnableProgram, target); } catch { await copyFile(spawnableProgram, target); }
+    return target;
+  }
+
+  // A launcher directory holding only the shims. The shim is run through node rather than
+  // by path, so nothing has to put node on PATH: borrowing a real system bin directory
+  // would carry a genuine extensionless git, which is the candidate these cases must miss.
   async function pathExtFixture() {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-pathext-"));
     cleanups.push(() => rm(root, { recursive: true, force: true }));
     const bin = path.join(root, "managed");
     const early = path.join(root, "early");
     const real = path.join(root, "real");
-    const nodeBin = path.join(root, "node-bin");
-    for (const directory of [bin, early, real, nodeBin]) await mkdir(directory);
-    await symlink(process.execPath, path.join(nodeBin, "node"));
+    for (const directory of [bin, early, real]) await mkdir(directory);
     await writeFile(path.join(bin, "git"), githubLauncherSource(), { mode: 0o700 });
     // `early` precedes `real`, so a case can put a wrapper ahead of an executable.
     return { root, bin, early, real,
-      searchPath: [early, real, nodeBin].join(path.delimiter) };
+      searchPath: [early, real].join(path.delimiter) };
+  }
+
+  // `path.basename(process.argv[1])` is still `git` and its realpath is still the launcher
+  // directory, so resolution is unchanged while the shim stays runnable on Windows, where
+  // an extensionless file cannot be spawned at all.
+  function runShim(fixture: { bin: string; root: string }, env: NodeJS.ProcessEnv) {
+    return exec(process.execPath, [path.join(fixture.bin, "git"), "--version"], { cwd: fixture.root, env });
   }
 
   it("resolves a PATHEXT-qualified executable when the extensionless name is absent", async () => {
@@ -36,21 +60,22 @@ describe("managed GitHub launchers", () => {
     // probes only path.join(dir, 'git') resolves nothing and the shim's own not-found
     // guard fires with exit 127 - every managed git call in an agent run fails.
     const fixture = await pathExtFixture();
-    await writeFile(path.join(fixture.real, "git.EXE"), "#!/bin/sh\necho resolved-through-pathext\n", { mode: 0o700 });
+    await placeSpawnable(fixture.real, "git.EXE");
     const env = { ...process.env, PATH: fixture.searchPath, PATHEXT: ".COM;.EXE;.BAT" };
-    const result = await exec(path.join(fixture.bin, "git"), ["--version"], { cwd: fixture.root, env });
-    expect(result.stdout.trim()).toBe("resolved-through-pathext");
+    const result = await runShim(fixture, env);
+    expect(result.stdout.trim()).toMatch(/^v\d+\./);
   });
 
   it("takes the executable when PATHEXT orders it ahead of a wrapper in the same directory", async () => {
     // The default PATHEXT puts .EXE before .CMD, so the ordinary Windows install where both
     // exist side by side must resolve to the executable.
     const fixture = await pathExtFixture();
-    await writeFile(path.join(fixture.real, "git.CMD"), "#!/bin/sh\necho batch-wrapper\n", { mode: 0o700 });
-    await writeFile(path.join(fixture.real, "git.EXE"), "#!/bin/sh\necho real-executable\n", { mode: 0o700 });
+    // The .CMD needs no valid content: selecting it would fail the version assertion.
+    await writeFile(path.join(fixture.real, "git.CMD"), "@echo off\r\necho batch-wrapper\r\n", { mode: 0o700 });
+    await placeSpawnable(fixture.real, "git.EXE");
     const env = { ...process.env, PATH: fixture.searchPath, PATHEXT: ".COM;.EXE;.BAT;.CMD" };
-    const result = await exec(path.join(fixture.bin, "git"), ["--version"], { cwd: fixture.root, env });
-    expect(result.stdout.trim()).toBe("real-executable");
+    const result = await runShim(fixture, env);
+    expect(result.stdout.trim()).toMatch(/^v\d+\./);
   });
 
   it.runIf(process.platform !== "win32")("runs an executable .cmd on POSIX instead of rejecting it", async () => {
@@ -59,9 +84,9 @@ describe("managed GitHub launchers", () => {
     // PATHEXT must keep working rather than losing managed git entirely.
     const fixture = await pathExtFixture();
     await writeFile(path.join(fixture.early, "git.CMD"), "#!/bin/sh\necho posix-cmd-is-executable\n", { mode: 0o700 });
-    await writeFile(path.join(fixture.real, "git.EXE"), "#!/bin/sh\necho real-executable\n", { mode: 0o700 });
+    await placeSpawnable(fixture.real, "git.EXE");
     const env = { ...process.env, PATH: fixture.searchPath, PATHEXT: ".COM;.EXE;.BAT;.CMD" };
-    const result = await exec(path.join(fixture.bin, "git"), ["--version"], { cwd: fixture.root, env });
+    const result = await runShim(fixture, env);
     expect(result.stdout.trim()).toBe("posix-cmd-is-executable");
   });
 
@@ -71,20 +96,21 @@ describe("managed GitHub launchers", () => {
     // with the wrapper's own setup silently bypassed. Fail with the reason instead.
     const fixture = await pathExtFixture();
     await writeFile(path.join(fixture.early, "git.CMD"), "@echo off\r\necho batch-wrapper\r\n", { mode: 0o700 });
-    await writeFile(path.join(fixture.real, "git.EXE"), "#!/bin/sh\necho real-executable\n", { mode: 0o700 });
+    // Never spawned: the guard reports the wrapper before reaching this one.
+    await writeFile(path.join(fixture.real, "git.EXE"), "", { mode: 0o700 });
     const env = { ...process.env, PATH: fixture.searchPath, PATHEXT: ".COM;.EXE;.BAT;.CMD" };
-    await expect(exec(path.join(fixture.bin, "git"), ["--version"], { cwd: fixture.root, env }))
-      .rejects.toThrow(/batch wrapper/);
+    await expect(runShim(fixture, env)).rejects.toThrow(/batch wrapper/);
   });
 
-  it("keeps resolving the extensionless program when PATHEXT is unset", async () => {
+  it.runIf(process.platform !== "win32")("keeps resolving the extensionless program when PATHEXT is unset", async () => {
     // POSIX regression guard: with no PATHEXT the candidate list must collapse to the one
-    // extensionless entry the lookup has always probed.
+    // extensionless entry the lookup has always probed. Windows cannot spawn an
+    // extensionless program at all, so the case is only meaningful here.
     const fixture = await pathExtFixture();
     await writeFile(path.join(fixture.real, "git"), "#!/bin/sh\necho resolved-without-pathext\n", { mode: 0o700 });
     const env: NodeJS.ProcessEnv = { ...process.env, PATH: fixture.searchPath };
     delete env.PATHEXT;
-    const result = await exec(path.join(fixture.bin, "git"), ["--version"], { cwd: fixture.root, env });
+    const result = await runShim(fixture, env);
     expect(result.stdout.trim()).toBe("resolved-without-pathext");
   });
   it.each(["repository", "command"])("uses explicit %s identity for local commits without managed credentials", async (identitySource) => {
